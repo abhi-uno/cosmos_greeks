@@ -26,6 +26,12 @@ class OptionType(Enum):
             raise ValueError(f"Invalid option type: {value}")
 
 
+class AssetClass(Enum):
+    """Asset class enumeration"""
+    EQUITY = 'EQUITY'
+    CRYPTO = 'CRYPTO'
+
+
 class VolatilityModel(Enum):
     """Supported volatility models"""
     BLACK_SCHOLES = 'BLACK_SCHOLES'

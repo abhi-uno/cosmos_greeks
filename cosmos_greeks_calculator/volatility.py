@@ -8,7 +8,7 @@ from scipy.stats import norm
 from typing import Optional, Tuple
 import warnings
 
-from .models import OptionType
+from .models import OptionType, AssetClass
 from .utils import get_option_flag, bound_implied_volatility
 from .errors import VolatilityCalculationError
 
@@ -29,9 +29,10 @@ class BlackScholesVolatility(VolatilityCalculator):
     Standard Black-Scholes implied volatility calculator
     """
 
-    def __init__(self):
+    def __init__(self, asset_class: AssetClass):
         self.max_iterations = 100
         self.tolerance = 1e-6
+        self.asset_class = asset_class
 
     def get_implied_volatility(self, spot: float, strike: float,
                                time_to_expiry: float, market_price: float,
@@ -74,7 +75,9 @@ class BlackScholesVolatility(VolatilityCalculator):
             )
 
             if iv is not None and 0.01 < iv < 10.0:
-                return bound_implied_volatility(iv, time_to_expiry * 365.25 * 24)
+                # Convert hours based on time_to_expiry already being in years
+                hours_to_expiry = time_to_expiry * 365.25 * 24
+                return bound_implied_volatility(iv, hours_to_expiry, self.asset_class)
 
         except Exception:
             pass
@@ -85,7 +88,8 @@ class BlackScholesVolatility(VolatilityCalculator):
                 spot, strike, time_to_expiry, market_price,
                 option_type, risk_free_rate
             )
-            return bound_implied_volatility(iv, time_to_expiry * 365.25 * 24)
+            hours_to_expiry = time_to_expiry * 365.25 * 24
+            return bound_implied_volatility(iv, hours_to_expiry, self.asset_class)
 
         except Exception as e:
             # Last resort: return a reasonable estimate
@@ -100,17 +104,24 @@ class BlackScholesVolatility(VolatilityCalculator):
 
         # For ATM options
         if 0.95 < spot / strike < 1.05:
-            return (market_price / spot) * np.sqrt(2 * np.pi / time_to_expiry)
+            initial_guess = (market_price / spot) * np.sqrt(2 * np.pi / time_to_expiry)
+        else:
+            # General approximation
+            moneyness = np.log(spot / strike)
+            normalized_price = market_price / spot
 
-        # General approximation
-        moneyness = np.log(spot / strike)
-        normalized_price = market_price / spot
+            # Adjusted for moneyness
+            initial_guess = normalized_price * np.sqrt(2 * np.pi / time_to_expiry)
+            initial_guess *= (1 + 0.25 * moneyness ** 2)
 
-        # Adjusted for moneyness
-        vol_estimate = normalized_price * np.sqrt(2 * np.pi / time_to_expiry)
-        vol_estimate *= (1 + 0.25 * moneyness ** 2)
+        # Adjust initial guess based on asset class
+        if self.asset_class == AssetClass.CRYPTO:
+            # Crypto typically has higher vol, adjust initial guess
+            initial_guess = np.clip(initial_guess, 0.3, 3.0)
+        else:
+            initial_guess = np.clip(initial_guess, 0.1, 2.0)
 
-        return np.clip(vol_estimate, 0.1, 2.0)
+        return initial_guess
 
     def _newton_raphson_iv(self, spot: float, strike: float, time_to_expiry: float,
                            market_price: float, option_type: OptionType,
@@ -135,15 +146,24 @@ class BlackScholesVolatility(VolatilityCalculator):
             if abs(vega) < 1e-10:
                 return None
 
-            # Newton step
-            vol -= price_diff / vega
+            # Newton step with damping for stability
+            vol_change = price_diff / vega
 
-            # Keep vol positive
-            vol = max(vol, 0.001)
+            # Damping factor for large changes
+            if abs(vol_change) > 0.5:
+                vol_change = 0.5 * np.sign(vol_change)
 
-            # Bound check
-            if vol > 10.0:
-                return None
+            vol -= vol_change
+
+            # Keep vol positive and within reasonable bounds
+            if self.asset_class == AssetClass.CRYPTO:
+                vol = max(vol, 0.1)  # Higher minimum for crypto
+                if vol > 5.0:  # Higher maximum for crypto
+                    return None
+            else:
+                vol = max(vol, 0.001)
+                if vol > 10.0:
+                    return None
 
         return None
 
@@ -160,9 +180,13 @@ class BlackScholesVolatility(VolatilityCalculator):
             )
             return price - market_price
 
-        # Find bounds where objective changes sign
-        vol_low = 0.01
-        vol_high = 5.0
+        # Set bounds based on asset class
+        if self.asset_class == AssetClass.CRYPTO:
+            vol_low = 0.1   # Higher lower bound for crypto
+            vol_high = 5.0  # Higher upper bound for crypto
+        else:
+            vol_low = 0.01
+            vol_high = 5.0
 
         # Adjust bounds if needed
         for _ in range(10):
@@ -225,16 +249,37 @@ class BlackScholesVolatility(VolatilityCalculator):
 
         moneyness = spot / strike
 
-        # Base volatility
-        if 0.95 < moneyness < 1.05:
-            # ATM
-            base_vol = 0.20
-        elif 0.90 < moneyness < 1.10:
-            # Near ATM
-            base_vol = 0.25
-        else:
-            # OTM/ITM
-            base_vol = 0.30
+        if self.asset_class == AssetClass.CRYPTO:
+            # Crypto volatility levels - much higher than equity
+            if 0.97 < moneyness < 1.03:
+                # ATM
+                base_vol = 0.60
+            elif 0.93 < moneyness < 1.07:
+                # Near ATM
+                base_vol = 0.70
+            else:
+                # OTM/ITM
+                base_vol = 0.80
+
+            # Adjust for time to expiry (time_to_expiry is already in years)
+            if time_to_expiry < 1 / 365:  # Less than 1 day
+                vol_mult = 1.3
+            elif time_to_expiry < 7 / 365:  # Less than 1 week
+                vol_mult = 1.1
+            else:
+                vol_mult = 1.0
+
+        else:  # EQUITY
+            # Base volatility
+            if 0.97 < moneyness < 1.03:
+                # ATM
+                base_vol = 0.15
+            elif 0.93 < moneyness < 1.07:
+                # Near ATM
+                base_vol = 0.20
+            else:
+                # OTM/ITM
+                base_vol = 0.25
 
         # Adjust for time to expiry
         if time_to_expiry < 1 / 365.25:  # Less than 1 day
@@ -254,7 +299,8 @@ class SABRVolatility(VolatilityCalculator):
     """
 
     def __init__(self, alpha: float = 0.25, beta: float = 0.5,
-                 rho: float = -0.3, nu: float = 0.4):
+                 rho: float = -0.3, nu: float = 0.4,
+                 asset_class: AssetClass = AssetClass.EQUITY):
         """
         Initialize SABR parameters
 
@@ -263,11 +309,18 @@ class SABRVolatility(VolatilityCalculator):
             beta: CEV exponent (0.5 for normal SABR)
             rho: Correlation between asset and volatility
             nu: Volatility of volatility
+            asset_class: EQUITY or CRYPTO
         """
         self.alpha = alpha
         self.beta = beta
         self.rho = rho
         self.nu = nu
+        self.asset_class = asset_class
+
+        # Adjust default parameters for crypto
+        if self.asset_class == AssetClass.CRYPTO:
+            self.alpha = alpha if alpha != 0.25 else 0.60  # Higher base vol
+            self.nu = nu if nu != 0.4 else 0.8  # Higher vol of vol
 
     def get_implied_volatility(self, spot: float, strike: float,
                                time_to_expiry: float, market_price: float,
@@ -286,7 +339,8 @@ class SABRVolatility(VolatilityCalculator):
             # General case
             iv = self._sabr_vol(forward, strike, time_to_expiry)
 
-        return bound_implied_volatility(iv, time_to_expiry * 365.25 * 24)
+        hours_to_expiry = time_to_expiry * 365.25 * 24
+        return bound_implied_volatility(iv, hours_to_expiry, self.asset_class)
 
     def _sabr_vol(self, forward: float, strike: float, time_to_expiry: float) -> float:
         """SABR volatility formula"""
@@ -311,9 +365,13 @@ class SABRVolatility(VolatilityCalculator):
         # z calculation
         z = (self.nu / self.alpha) * fk_beta * log_fk
 
-        # x calculation
-        x_numerator = np.sqrt(1 - 2 * self.rho * z + z ** 2) + z - self.rho
-        x = np.log(x_numerator / (1 - self.rho))
+        # Avoid numerical issues
+        if abs(z) < 1e-10:
+            x = 1.0
+        else:
+            # x calculation
+            x_numerator = np.sqrt(1 - 2 * self.rho * z + z ** 2) + z - self.rho
+            x = np.log(x_numerator / (1 - self.rho))
 
         # A term
         a = self.alpha / (fk_beta * (1 + (1 - self.beta) ** 2 / 24 * log_fk ** 2 +
@@ -351,6 +409,11 @@ class SABRVolatility(VolatilityCalculator):
         """SABR formula for beta = 1 (lognormal)"""
 
         log_fk = np.log(forward / strike)
+
+        if abs(log_fk) < 1e-10:
+            # ATM case
+            return self._sabr_atm_vol(forward, time_to_expiry)
+
         z = (self.nu / self.alpha) * log_fk
         x = np.log((np.sqrt(1 - 2 * self.rho * z + z ** 2) + z - self.rho) / (1 - self.rho))
 
@@ -369,6 +432,11 @@ class SABRVolatility(VolatilityCalculator):
         """SABR formula for beta = 0 (normal)"""
 
         v = forward - strike
+
+        if abs(v) < 1e-10:
+            # ATM case
+            return self.alpha
+
         z = (self.nu / self.alpha) * v
         x = np.log((np.sqrt(1 - 2 * self.rho * z + z ** 2) + z - self.rho) / (1 - self.rho))
 
@@ -391,7 +459,8 @@ class SVIVolatility(VolatilityCalculator):
     """
 
     def __init__(self, a: float = 0.04, b: float = 0.1,
-                 sigma: float = 0.1, rho: float = -0.3, m: float = 0.0):
+                 sigma: float = 0.1, rho: float = -0.3, m: float = 0.0,
+                 asset_class: AssetClass = AssetClass.EQUITY):
         """
         Initialize SVI parameters
 
@@ -401,12 +470,19 @@ class SVIVolatility(VolatilityCalculator):
             sigma: Smoothness parameter
             rho: Rotation parameter
             m: Translation parameter
+            asset_class: EQUITY or CRYPTO
         """
         self.a = a
         self.b = b
         self.sigma = sigma
         self.rho = rho
         self.m = m
+        self.asset_class = asset_class
+
+        # Adjust default parameters for crypto
+        if self.asset_class == AssetClass.CRYPTO:
+            self.a = a if a != 0.04 else 0.36  # Higher base variance
+            self.b = b if b != 0.1 else 0.3    # Steeper smile
 
     def get_implied_volatility(self, spot: float, strike: float,
                                time_to_expiry: float, market_price: float,
@@ -426,15 +502,19 @@ class SVIVolatility(VolatilityCalculator):
         # Implied volatility
         iv = np.sqrt(max(variance, 0.0001) / time_to_expiry)
 
-        return bound_implied_volatility(iv, time_to_expiry * 365.25 * 24)
+        hours_to_expiry = time_to_expiry * 365.25 * 24
+        return bound_implied_volatility(iv, hours_to_expiry, self.asset_class)
 
 
-def create_volatility_calculator(model: str = 'BLACK_SCHOLES', **params) -> VolatilityCalculator:
+def create_volatility_calculator(model: str = 'BLACK_SCHOLES',
+                                 asset_class: AssetClass = AssetClass.EQUITY,
+                                 **params) -> VolatilityCalculator:
     """
     Factory function to create volatility calculator
 
     Args:
         model: Model name ('BLACK_SCHOLES', 'SABR', 'SVI')
+        asset_class: EQUITY or CRYPTO
         **params: Model-specific parameters
 
     Returns:
@@ -443,10 +523,10 @@ def create_volatility_calculator(model: str = 'BLACK_SCHOLES', **params) -> Vola
     model = model.upper()
 
     if model == 'BLACK_SCHOLES':
-        return BlackScholesVolatility()
+        return BlackScholesVolatility(asset_class=asset_class)
     elif model == 'SABR':
-        return SABRVolatility(**params)
+        return SABRVolatility(asset_class=asset_class, **params)
     elif model == 'SVI':
-        return SVIVolatility(**params)
+        return SVIVolatility(asset_class=asset_class, **params)
     else:
         raise ValueError(f"Unknown volatility model: {model}")

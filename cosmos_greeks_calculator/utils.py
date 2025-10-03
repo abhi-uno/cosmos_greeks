@@ -5,37 +5,71 @@ Utility functions for the Greeks calculator
 from datetime import datetime, time, timedelta
 import numpy as np
 from typing import Union, Optional
-import QuantLib as ql
 
-from .models import OptionType
+from .models import OptionType, AssetClass
 from .errors import ValidationError, TimeToExpiryError
 
-# Market constants
+# Market constants for equity
 MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
 TRADING_HOURS_PER_DAY = 6.25
 TRADING_DAYS_PER_YEAR = 252
 
+# Crypto market constants
+CRYPTO_HOURS_PER_YEAR = 8760  # 365 * 24
+CRYPTO_EXPIRY_TIME = time(17, 30)  # 5:30 PM IST for Delta Exchange
+
 # Underlying specifications
 LOT_SIZES = {
+    # Equity indices
     'NIFTY': 50,
     'SENSEX': 10,
     'BANKNIFTY': 15,
-    'FINNIFTY': 40
+    'FINNIFTY': 40,
+    # Crypto (Delta Exchange)
+    'BTC': 0.001,
+    'ETH': 0.01
 }
 
 STRIKE_INTERVALS = {
+    # Equity indices
     'NIFTY': 50,
     'SENSEX': 100,
     'BANKNIFTY': 100,
-    'FINNIFTY': 50
+    'FINNIFTY': 50,
+    # Crypto - None indicates dynamic strikes
+    'BTC': None,
+    'ETH': None
 }
 
 
 def calculate_hours_to_expiry(expiry_datetime: datetime,
+                              current_datetime: Optional[datetime] = None,
+                              asset_class: AssetClass = AssetClass.EQUITY) -> float:
+    """
+    Calculate hours remaining to expiry based on asset class
+
+    Args:
+        expiry_datetime: Expiry date and time
+        current_datetime: Current date and time (defaults to now)
+        asset_class: EQUITY or CRYPTO
+
+    Returns:
+        Hours to expiry (trading hours for equity, calendar hours for crypto)
+
+    Raises:
+        TimeToExpiryError: If calculation fails
+    """
+    if asset_class == AssetClass.CRYPTO:
+        return calculate_hours_to_expiry_crypto(expiry_datetime, current_datetime)
+    else:
+        return calculate_hours_to_expiry_equity(expiry_datetime, current_datetime)
+
+
+def calculate_hours_to_expiry_equity(expiry_datetime: datetime,
                               current_datetime: Optional[datetime] = None) -> float:
     """
-    Calculate trading hours remaining to expiry
+    Calculate trading hours remaining to expiry for equity options
 
     Args:
         expiry_datetime: Expiry date and time
@@ -118,11 +152,42 @@ def calculate_hours_to_expiry(expiry_datetime: datetime,
         raise TimeToExpiryError(f"Failed to calculate time to expiry: {str(e)}")
 
 
+def calculate_hours_to_expiry_crypto(expiry_datetime: datetime,
+                                     current_datetime: Optional[datetime] = None) -> float:
+    """
+    Calculate calendar hours remaining to expiry for crypto options
+
+    Args:
+        expiry_datetime: Expiry date and time
+        current_datetime: Current date and time (defaults to now)
+
+    Returns:
+        Calendar hours to expiry (continuous 24/7 market)
+
+    Raises:
+        TimeToExpiryError: If calculation fails
+    """
+    try:
+        if current_datetime is None:
+            current_datetime = datetime.now()
+
+        # If already expired
+        if current_datetime >= expiry_datetime:
+            return 0.0
+
+        # Simple calculation - crypto markets are 24/7
+        hours = (expiry_datetime - current_datetime).total_seconds() / 3600
+
+        return max(0.0, hours)
+
+    except Exception as e:
+        raise TimeToExpiryError(f"Failed to calculate crypto time to expiry: {str(e)}")
+
+
 def validate_inputs(spot: float, strike: float, market_price: float,
                     option_type: Union[str, OptionType]) -> OptionType:
     """
-    Validate input parameters - RELAXED VERSION
-    Now only does basic sanity checks, intrinsic violations handled in calculator
+    Validate input parameters
 
     Returns:
         Validated OptionType
@@ -150,21 +215,12 @@ def validate_inputs(spot: float, strike: float, market_price: float,
         raise ValidationError(f"Invalid option type: {option_type}")
 
     # Sanity check: option price shouldn't exceed spot by too much
-    # Relaxed to 150% to avoid false positives
     if market_price > spot * 1.5:
         raise ValidationError(
             f"Option price {market_price} seems too high relative to spot {spot}"
         )
 
-    # REMOVED: Intrinsic value checks - now handled in calculator._calculate_adjusted_price
-    # The calculator will adjust prices below intrinsic rather than failing
-
     return option_type
-
-
-def convert_to_quantlib_date(dt: datetime) -> ql.Date:
-    """Convert Python datetime to QuantLib Date"""
-    return ql.Date(dt.day, dt.month, dt.year)
 
 
 def get_option_flag(option_type: OptionType) -> str:
@@ -207,30 +263,48 @@ def is_deep_otm(spot: float, strike: float, option_type: OptionType,
         return moneyness > (1 + threshold)
 
 
-def bound_implied_volatility(iv: float, hours_to_expiry: float) -> float:
+def bound_implied_volatility(iv: float, hours_to_expiry: float,
+                             asset_class: AssetClass = AssetClass.EQUITY) -> float:
     """
-    Bound implied volatility to reasonable range
+    Bound implied volatility to reasonable range based on asset class
 
     Args:
         iv: Raw implied volatility
         hours_to_expiry: Time to expiry in hours
+        asset_class: EQUITY or CRYPTO
 
     Returns:
         Bounded implied volatility
     """
-    # Base bounds
-    min_iv = 0.05  # 5%
-    max_iv = 2.0  # 200%
+    if asset_class == AssetClass.CRYPTO:
+        # Crypto bounds - wider range
+        min_iv = 0.20  # 20%
+        max_iv = 3.0   # 300%
 
-    # Adjust bounds based on time to expiry
-    if hours_to_expiry < 1:
-        # Near expiry can have extreme IVs
-        min_iv = 0.10
-        max_iv = 5.0
-    elif hours_to_expiry < 6.25:
-        # Intraday
-        min_iv = 0.08
-        max_iv = 3.0
+        # Adjust bounds based on time to expiry
+        if hours_to_expiry < 1:
+            # Near expiry can have extreme IVs
+            min_iv = 0.30
+            max_iv = 5.0
+        elif hours_to_expiry < 24:
+            # Same day
+            min_iv = 0.25
+            max_iv = 4.0
+
+    else:  # EQUITY
+        # Base bounds
+        min_iv = 0.05  # 5%
+        max_iv = 2.0  # 200%
+
+        # Adjust bounds based on time to expiry
+        if hours_to_expiry < 1:
+            # Near expiry can have extreme IVs
+            min_iv = 0.10
+            max_iv = 5.0
+        elif hours_to_expiry < 6.25:
+            # Intraday
+            min_iv = 0.08
+            max_iv = 3.0
 
     return np.clip(iv, min_iv, max_iv)
 

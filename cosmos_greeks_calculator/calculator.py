@@ -7,11 +7,12 @@ import pandas as pd
 from datetime import datetime
 from typing import Dict, List, Union, Optional
 import warnings
-import QuantLib as ql
+import logging
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 
 from .models import (
     GreeksResult, OptionType, VolatilityModel,
-    MarketData, PositionGreeks, PortfolioGreeks
+    MarketData, PositionGreeks, PortfolioGreeks, AssetClass
 )
 from .errors import (
     GreeksCalculationError, ValidationError,
@@ -19,7 +20,9 @@ from .errors import (
 )
 from .utils import (
     calculate_hours_to_expiry, validate_inputs,
-    LOT_SIZES, STRIKE_INTERVALS, get_option_flag
+    LOT_SIZES, STRIKE_INTERVALS, get_option_flag,
+    TRADING_DAYS_PER_YEAR, TRADING_HOURS_PER_DAY,
+    CRYPTO_HOURS_PER_YEAR
 )
 from .engines import select_engine, DigitalGreeksEngine
 from .volatility import create_volatility_calculator
@@ -31,7 +34,8 @@ def calculate_greeks(spot: float,
                      expiry_datetime: datetime,
                      market_price: float,
                      option_type: Union[str, OptionType],
-                     underlying: str = 'NIFTY',
+                     underlying: str,
+                     asset_class: Union[str, AssetClass],
                      risk_free_rate: float = 0.0,
                      volatility_model: str = 'BLACK_SCHOLES',
                      current_datetime: Optional[datetime] = None,
@@ -45,7 +49,8 @@ def calculate_greeks(spot: float,
         expiry_datetime: Option expiry date and time
         market_price: Current market price of option
         option_type: 'CE'/'PE' or OptionType enum
-        underlying: Underlying instrument ('NIFTY', 'SENSEX', etc.)
+        underlying: Underlying instrument ('NIFTY', 'BTC', etc.)
+        asset_class: 'EQUITY'/'CRYPTO' or AssetClass enum (REQUIRED)
         risk_free_rate: Risk-free interest rate (default: 0.0)
         volatility_model: Volatility model to use
         current_datetime: Current date and time (defaults to now)
@@ -58,21 +63,31 @@ def calculate_greeks(spot: float,
         import cosmos_greeks_calculator as cgc
         from datetime import datetime
 
+        # Equity option
         result = cgc.calculate_greeks(
             spot=25000,
             strike=25100,
             expiry_datetime=datetime(2025, 7, 10, 15, 30),
             market_price=45.5,
-            option_type='CE'
+            option_type='CE',
+            underlying='NIFTY',
+            asset_class='EQUITY'
         )
 
-        print(f"Delta: {result.delta}")
-        print(f"Gamma: {result.gamma}")
-        print(f"Theta: {result.theta}")
-        print(f"Vega: {result.vega}")
+        # Crypto option
+        result = cgc.calculate_greeks(
+            spot=43500,
+            strike=44000,
+            expiry_datetime=datetime(2025, 1, 31, 17, 30),
+            market_price=850,
+            option_type='CE',
+            underlying='BTC',
+            asset_class='CRYPTO'
+        )
     """
     calculator = GreeksCalculator(
         underlying=underlying,
+        asset_class=asset_class,
         risk_free_rate=risk_free_rate,
         volatility_model=volatility_model,
         **volatility_params
@@ -92,31 +107,29 @@ class GreeksCalculator:
     """
     Thread-safe Greeks calculator for production use
 
-    Each thread should create its own instance to avoid QuantLib state conflicts.
-
     Attributes:
         underlying: Underlying instrument name
+        asset_class: EQUITY or CRYPTO
         risk_free_rate: Risk-free interest rate
         volatility_model: Volatility model to use
 
     Example:
-        calculator = GreeksCalculator(underlying='NIFTY')
-
-        # Single calculation
-        result = calculator.calculate(
-            spot=25000,
-            strike=25100,
-            expiry_datetime=datetime(2025, 7, 10, 15, 30),
-            market_price=45.5,
-            option_type='CE'
+        # Equity calculator
+        calculator = GreeksCalculator(
+            underlying='NIFTY',
+            asset_class='EQUITY'
         )
 
-        # Batch calculation
-        results = calculator.calculate_batch(positions_df)
+        # Crypto calculator
+        calculator = GreeksCalculator(
+            underlying='BTC',
+            asset_class='CRYPTO'
+        )
     """
 
     def __init__(self,
-                 underlying: str = 'NIFTY',
+                 underlying: str,
+                 asset_class: Union[str, AssetClass],
                  risk_free_rate: float = 0.0,
                  volatility_model: str = 'BLACK_SCHOLES',
                  **volatility_params):
@@ -124,7 +137,8 @@ class GreeksCalculator:
         Initialize the Greeks calculator
 
         Args:
-            underlying: Underlying instrument ('NIFTY', 'SENSEX', etc.)
+            underlying: Underlying instrument ('NIFTY', 'BTC', etc.)
+            asset_class: 'EQUITY'/'CRYPTO' or AssetClass enum (REQUIRED)
             risk_free_rate: Risk-free interest rate (annual)
             volatility_model: Model for IV calculation
             **volatility_params: Parameters for volatility model
@@ -134,28 +148,36 @@ class GreeksCalculator:
         self.volatility_model = volatility_model.upper()
         self.volatility_params = volatility_params
 
+        # Convert and validate asset class
+        if isinstance(asset_class, str):
+            try:
+                self.asset_class = AssetClass[asset_class.upper()]
+            except KeyError:
+                raise ValueError(f"Invalid asset class: {asset_class}. Must be 'EQUITY' or 'CRYPTO'")
+        elif isinstance(asset_class, AssetClass):
+            self.asset_class = asset_class
+        else:
+            raise ValueError(f"asset_class must be AssetClass enum or string, got {type(asset_class)}")
+
         # Validate underlying
         if self.underlying not in LOT_SIZES:
-            warnings.warn(f"Unknown underlying {self.underlying}, using NIFTY defaults")
-            self.lot_size = 50
+            warnings.warn(f"Unknown underlying {self.underlying}, using defaults")
+            if self.asset_class == AssetClass.CRYPTO:
+                self.lot_size = 0.001  # Default crypto lot size
+                self.strike_interval = None
+            else:
+                self.lot_size = 50  # Default equity lot size
             self.strike_interval = 50
         else:
             self.lot_size = LOT_SIZES[self.underlying]
             self.strike_interval = STRIKE_INTERVALS[self.underlying]
 
-        # Setup QuantLib for this instance
-        self._setup_quantlib()
-
-        # Create volatility calculator
+        # Create volatility calculator with asset class
         self.vol_calculator = create_volatility_calculator(
-            self.volatility_model, **self.volatility_params
+            self.volatility_model,
+            asset_class=self.asset_class,
+            **self.volatility_params
         )
-
-    def _setup_quantlib(self):
-        """Setup QuantLib for this thread/instance"""
-        self.evaluation_date = ql.Date.todaysDate()
-        # Note: QuantLib.Settings is global, so be careful in multi-threaded environments
-        ql.Settings.instance().evaluationDate = self.evaluation_date
 
     def _calculate_adjusted_price(self, spot: float, strike: float,
                                   market_price: float, option_type: OptionType,
@@ -174,8 +196,13 @@ class GreeksCalculator:
 
         # Check if adjustment needed (with 5% tolerance)
         if market_price < intrinsic * 0.95:
-            # Calculate premium based on time to expiry
-            days_to_expiry = hours_to_expiry / 6.25  # Convert to trading days
+            # Calculate premium based on time to expiry and asset class
+            if self.asset_class == AssetClass.CRYPTO:
+                # Crypto: Use calendar days
+                days_to_expiry = hours_to_expiry / 24
+            else:
+                # Equity: Use trading days
+                days_to_expiry = hours_to_expiry / 6.25
 
             if days_to_expiry <= 7:
                 premium_pct = 0.02  # 2%
@@ -210,11 +237,12 @@ class GreeksCalculator:
             market_price: Current market price of option
             option_type: Option type ('CE'/'PE' or OptionType)
             current_datetime: Current date and time (defaults to now)
+
         Returns:
             GreeksResult object
         """
         try:
-            # Basic input validation (without intrinsic check)
+            # Basic input validation
             if spot <= 0:
                 return GreeksResult.create_invalid(f"Spot price must be positive, got {spot}")
             if strike <= 0:
@@ -231,8 +259,10 @@ class GreeksCalculator:
             elif not isinstance(option_type, OptionType):
                 return GreeksResult.create_invalid(f"Invalid option type: {option_type}")
 
-            # Calculate hours to expiry
-            hours_to_expiry = calculate_hours_to_expiry(expiry_datetime, current_datetime)
+            # Calculate hours to expiry based on asset class
+            hours_to_expiry = calculate_hours_to_expiry(
+                expiry_datetime, current_datetime, self.asset_class
+            )
 
             # Handle expired options
             if hours_to_expiry <= 0:
@@ -245,10 +275,13 @@ class GreeksCalculator:
                 spot, strike, market_price, option_type, hours_to_expiry
             )
 
-            # Convert to time in years for calculations
-            # CRITICAL: hours_to_expiry is in TRADING hours, not calendar hours
-            # There are 252 trading days per year, 6.25 hours per day
-            time_to_expiry = hours_to_expiry / (252 * 6.25)
+            # Convert to time in years based on asset class
+            if self.asset_class == AssetClass.CRYPTO:
+                # Crypto: 365 * 24 = 8760 hours per year
+                time_to_expiry = hours_to_expiry / CRYPTO_HOURS_PER_YEAR
+            else:
+                # Equity: 252 * 6.25 = 1575 trading hours per year
+                time_to_expiry = hours_to_expiry / (TRADING_DAYS_PER_YEAR * TRADING_HOURS_PER_DAY)
 
             # Calculate implied volatility with adjusted price
             try:
@@ -265,10 +298,9 @@ class GreeksCalculator:
                 implied_vol = self._estimate_fallback_volatility(
                     spot, strike, hours_to_expiry, option_type
                 )
-                # Don't warn for every calculation, just use the fallback
 
-            # Select appropriate engine
-            engine = select_engine(hours_to_expiry)
+            # Select appropriate engine based on asset class
+            engine = select_engine(hours_to_expiry, self.asset_class)
 
             # Calculate Greeks
             greeks = engine.calculate(
@@ -277,7 +309,8 @@ class GreeksCalculator:
                 time_to_expiry=time_to_expiry,
                 volatility=implied_vol,
                 risk_free_rate=self.risk_free_rate,
-                option_type=option_type
+                option_type=option_type,
+                asset_class=self.asset_class
             )
 
             # Special handling for near-expiry theta ONLY for digital engine
@@ -288,9 +321,7 @@ class GreeksCalculator:
             # Get method name
             method_map = {
                 'DigitalGreeksEngine': 'digital',
-                'AnalyticalGreeksEngine': 'analytical',
-                'ScaledVolatilityEngine': 'quantlib_scaled',
-                'QuantLibGreeksEngine': 'quantlib_standard'
+                'AnalyticalGreeksEngine': 'analytical'
             }
             method_name = method_map.get(engine.__class__.__name__, 'unknown')
 
@@ -329,13 +360,103 @@ class GreeksCalculator:
                 partial_results={'hours_to_expiry': hours_to_expiry if 'hours_to_expiry' in locals() else 0}
             )
 
+    # def calculate_vectorized(self,
+    #                          spots: np.ndarray,
+    #                          strikes: np.ndarray,
+    #                          expiry_datetimes: np.ndarray,
+    #                          market_prices: np.ndarray,
+    #                          option_types: np.ndarray,
+    #                          current_datetimes: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+    #     """
+    #     Vectorized Greeks calculation for performance
+    #
+    #     Args:
+    #         spots: Array of spot prices
+    #         strikes: Array of strike prices
+    #         expiry_datetimes: Array of expiry datetimes
+    #         market_prices: Array of market prices
+    #         option_types: Array of option types (1 for CE, 0 for PE)
+    #         current_datetimes: Array of current datetimes (defaults to now for each)
+    #
+    #     Returns:
+    #         Dictionary with arrays for each Greek and metadata
+    #     """
+    #     n = len(spots)
+    #
+    #     # If current_datetimes not provided, use None for each calculation
+    #     if current_datetimes is None:
+    #         current_datetimes = [None] * n
+    #
+    #     # Initialize result arrays
+    #     delta = np.zeros(n)
+    #     gamma = np.zeros(n)
+    #     theta = np.zeros(n)
+    #     vega = np.zeros(n)
+    #     rho = np.zeros(n)
+    #     iv = np.zeros(n)
+    #     is_valid = np.ones(n, dtype=bool)
+    #     calculation_methods = [''] * n  # Track calculation method for each
+    #
+    #     # Calculate hours to expiry for all positions
+    #     hours_to_expiry = np.zeros(n)
+    #     for i in range(n):
+    #         hours_to_expiry[i] = calculate_hours_to_expiry(
+    #             expiry_datetimes[i],
+    #             current_datetimes[i],
+    #             self.asset_class
+    #         )
+    #
+    #     # Process each position
+    #     for i in range(n):
+    #         try:
+    #             # Convert option type
+    #             opt_type = OptionType.CE if option_types[i] == 1 else OptionType.PE
+    #
+    #             # Calculate single Greek with current_datetime
+    #             result = self.calculate(
+    #                 spot=spots[i],
+    #                 strike=strikes[i],
+    #                 expiry_datetime=expiry_datetimes[i],
+    #                 market_price=market_prices[i],
+    #                 option_type=opt_type,
+    #                 current_datetime=current_datetimes[i]
+    #             )
+    #
+    #             # Store results
+    #             delta[i] = result.delta
+    #             gamma[i] = result.gamma
+    #             theta[i] = result.theta
+    #             vega[i] = result.vega
+    #             rho[i] = result.rho
+    #             iv[i] = result.implied_volatility
+    #             is_valid[i] = result.is_valid
+    #             calculation_methods[i] = result.calculation_method
+    #
+    #         except Exception as e:
+    #             is_valid[i] = False
+    #             warnings.warn(f"Failed to calculate Greeks for position {i}: {str(e)}")
+    #
+    #     return {
+    #         'delta': delta,
+    #         'gamma': gamma,
+    #         'theta': theta,
+    #         'vega': vega,
+    #         'rho': rho,
+    #         'implied_volatility': iv,
+    #         'hours_to_expiry': hours_to_expiry,
+    #         'is_valid': is_valid,
+    #         'calculation_methods': calculation_methods
+    #     }
+
     def calculate_vectorized(self,
                              spots: np.ndarray,
                              strikes: np.ndarray,
                              expiry_datetimes: np.ndarray,
                              market_prices: np.ndarray,
                              option_types: np.ndarray,
-                             current_datetimes: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+                             current_datetimes: Optional[np.ndarray] = None,
+                             show_progress: bool = False,
+                            process_id: Optional[str] = None) -> Dict[str, np.ndarray]:
         """
         Vectorized Greeks calculation for performance
 
@@ -346,11 +467,23 @@ class GreeksCalculator:
             market_prices: Array of market prices
             option_types: Array of option types (1 for CE, 0 for PE)
             current_datetimes: Array of current datetimes (defaults to now for each)
+            show_progress: Whether to show progress (default: False)
 
         Returns:
             Dictionary with arrays for each Greek and metadata
         """
+        import time
+
         n = len(spots)
+        # Create process prefix for logging
+        log_prefix = f"[{process_id}] " if process_id else "  "
+
+        # Progress tracking setup
+        if show_progress:
+            logging.info(f"{log_prefix}Calculating Greeks for {n} options...")
+            # progress_interval = max(n // 20, 100)  # Show 20 updates or every 100 items
+            progress_interval = 500
+            start_time = time.time()
 
         # If current_datetimes not provided, use None for each calculation
         if current_datetimes is None:
@@ -366,16 +499,25 @@ class GreeksCalculator:
         is_valid = np.ones(n, dtype=bool)
         calculation_methods = [''] * n  # Track calculation method for each
 
-        # Calculate hours to expiry for all positions using provided current_datetimes
+        # Calculate hours to expiry for all positions
         hours_to_expiry = np.zeros(n)
         for i in range(n):
             hours_to_expiry[i] = calculate_hours_to_expiry(
                 expiry_datetimes[i],
-                current_datetimes[i]  # This will use the provided datetime or default to now()
+                current_datetimes[i],
+                self.asset_class
             )
 
         # Process each position
         for i in range(n):
+            # Show progress
+            if show_progress and i > 0 and i % progress_interval == 0:
+                pct_done = (i / n) * 100
+                elapsed = time.time() - start_time
+                rate = i / elapsed
+                remaining = (n - i) / rate
+                logging.info(f"{log_prefix} Progress: {i}/{n} ({pct_done:.1f}%) - Est. {remaining:.1f}s remaining")
+
             try:
                 # Convert option type
                 opt_type = OptionType.CE if option_types[i] == 1 else OptionType.PE
@@ -387,7 +529,7 @@ class GreeksCalculator:
                     expiry_datetime=expiry_datetimes[i],
                     market_price=market_prices[i],
                     option_type=opt_type,
-                    current_datetime=current_datetimes[i]  # Pass the specific datetime
+                    current_datetime=current_datetimes[i]
                 )
 
                 # Store results
@@ -404,6 +546,11 @@ class GreeksCalculator:
                 is_valid[i] = False
                 warnings.warn(f"Failed to calculate Greeks for position {i}: {str(e)}")
 
+        # Clear the progress line and show completion
+        if show_progress:
+            elapsed = time.time() - start_time
+            print(f"  Completed {n} options in {elapsed:.1f}s ({n / elapsed:.0f} options/sec)          ")
+
         return {
             'delta': delta,
             'gamma': gamma,
@@ -413,7 +560,7 @@ class GreeksCalculator:
             'implied_volatility': iv,
             'hours_to_expiry': hours_to_expiry,
             'is_valid': is_valid,
-            'calculation_methods': calculation_methods  # Added for tracking
+            'calculation_methods': calculation_methods
         }
 
     def calculate_batch(self, positions: Union[pd.DataFrame, List[Dict]]) -> List[GreeksResult]:
@@ -441,7 +588,7 @@ class GreeksCalculator:
                 expiry_datetime=pos['expiry_datetime'],
                 market_price=pos['market_price'],
                 option_type=pos['option_type'],
-                current_datetime=pos.get('current_datetime')  # Optional
+                current_datetime=pos.get('current_datetime')
             )
             results.append(result)
 
@@ -456,6 +603,7 @@ class GreeksCalculator:
                 - spot, strike, expiry_datetime, market_price, option_type
                 - quantity: Position size (negative for short)
                 - multiplier: Contract multiplier (optional, uses lot size)
+                - current_datetime (optional)
 
         Returns:
             PortfolioGreeks object with aggregated Greeks
@@ -575,24 +723,40 @@ class GreeksCalculator:
 
         moneyness = spot / strike
 
-        # Base volatility by moneyness
-        if 0.97 < moneyness < 1.03:
-            base_vol = 0.15  # ATM
-        elif 0.93 < moneyness < 1.07:
-            base_vol = 0.20  # Near ATM
-        else:
-            base_vol = 0.25  # OTM/ITM
+        if self.asset_class == AssetClass.CRYPTO:
+            # Crypto volatility estimates
+            if 0.97 < moneyness < 1.03:
+                base_vol = 0.60  # ATM
+            elif 0.93 < moneyness < 1.07:
+                base_vol = 0.70  # Near ATM
+            else:
+                base_vol = 0.80  # OTM/ITM
 
-        # Adjust for underlying
-        if self.underlying == 'BANKNIFTY':
-            base_vol *= 1.2
-        elif self.underlying == 'FINNIFTY':
-            base_vol *= 1.1
+            # Adjust for time to expiry
+            if hours_to_expiry < 2:
+                base_vol *= 1.3
+            elif hours_to_expiry < 24:
+                base_vol *= 1.1
 
-        # Adjust for time to expiry
-        if hours_to_expiry < 2:
-            base_vol *= 1.5
-        elif hours_to_expiry < 6.25:
-            base_vol *= 1.2
+        else:  # EQUITY
+            # Base volatility by moneyness
+            if 0.97 < moneyness < 1.03:
+                base_vol = 0.15  # ATM
+            elif 0.93 < moneyness < 1.07:
+                base_vol = 0.20  # Near ATM
+            else:
+                base_vol = 0.25  # OTM/ITM
+
+            # Adjust for underlying
+            if self.underlying == 'BANKNIFTY':
+                base_vol *= 1.2
+            elif self.underlying == 'FINNIFTY':
+                base_vol *= 1.1
+
+            # Adjust for time to expiry
+            if hours_to_expiry < 2:
+                base_vol *= 1.5
+            elif hours_to_expiry < 6.25:
+                base_vol *= 1.2
 
         return base_vol
